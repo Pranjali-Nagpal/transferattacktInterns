@@ -1300,12 +1300,36 @@ def _mfaa_select_feature_layers(model, max_layers=5):
     return selected
 
 
+def _mfaa_uniquify_layer_names(model):
+    seen = {}
+    stack = list(getattr(model, 'layers', []))
+    while stack:
+        layer = stack.pop(0)
+        nested = getattr(layer, 'layers', None)
+        if nested:
+            stack.extend(list(nested))
+        name = getattr(layer, 'name', None)
+        if not name:
+            continue
+        count = seen.get(name, 0)
+        seen[name] = count + 1
+        if count == 0:
+            continue
+        unique_name = f'{name}_mfaa_{count}'
+        if hasattr(layer, '_name'):
+            layer._name = unique_name
+
+
 def _mfaa_build_feature_model(model):
+    _mfaa_uniquify_layer_names(model)
     layers = _mfaa_select_feature_layers(model)
     if not layers:
         return None
     outputs = [model.output] + [layer.output for layer in layers]
-    return tf.keras.Model(inputs=model.input, outputs=outputs)
+    try:
+        return tf.keras.Model(inputs=model.input, outputs=outputs)
+    except ValueError:
+        return None
 
 
 def _mfaa_score_from_embedding(emb, tgt_emb, attack_type):
