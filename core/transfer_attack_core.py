@@ -40,6 +40,7 @@ ALL_ATTACKS = [
     'IDAA',
     'DPA_HMA',
     'DYNAMIC_MORPH',
+    'ANDA',
 ]
 
 ATTACK_COLS = {
@@ -62,6 +63,7 @@ ATTACK_COLS = {
     'IDAA': 'idaa_path',
     'DYNAMIC_MORPH': 'dynamic_morph_path',
     'DPA_HMA': 'dpa_hma_path',
+    'ANDA': 'anda_path',
 }
 
 EPSILON = 0.062
@@ -83,6 +85,9 @@ GRA_SIGN_DECAY = 0.94
 PGN_BETA = 3.0
 PGN_GAMMA = 0.5
 PGN_NUM_NEIGHBOR = 20
+ANDA_NUM_NEIGHBOR = 5
+ANDA_BETA = 3.0
+ANDA_SAMPLE_SCALE = 1.0
 DPA_HMA_SEED = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_SEED', '1'))
 DPA_HMA_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_NUM_ITER', str(NUM_ITER)))
 DPA_HMA_ENSEMBLE_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_ENSEMBLE_NUM_ITER', str(DPA_HMA_NUM_ITER)))
@@ -1273,6 +1278,88 @@ def pgn_attack(model, x, tgt_emb, attack_type):
     return adv
 
 
+
+def _anda_collect_distribution(noises):
+    noise_batch = tf.concat(noises, axis=0)
+    noise_mean = tf.reduce_mean(noise_batch, axis=0, keepdims=True)
+    cov_sqrt = tf.reshape(noise_batch - noise_mean, [tf.shape(noise_batch)[0], -1])
+    return noise_mean, cov_sqrt
+
+
+def _anda_sample(noise_mean, cov_sqrt, data_shape, scale=ANDA_SAMPLE_SCALE):
+    k_val = tf.shape(cov_sqrt)[0]
+    if scale == 0.0:
+        return noise_mean
+    if int(cov_sqrt.shape[0] or 0) <= 1:
+        return noise_mean
+    z_val = tf.random.normal([1, k_val], dtype=noise_mean.dtype)
+    cov_sample = tf.matmul(z_val, cov_sqrt)
+    cov_sample = cov_sample / tf.sqrt(tf.cast(k_val - 1, noise_mean.dtype))
+    cov_sample = tf.reshape(cov_sample, data_shape)
+    return noise_mean + scale * cov_sample
+
+
+# ANDA adapted from the official asymptotically normal distribution learning
+# strategy to this repository's cosine-similarity face-verification objective.
+def anda_attack(model, x, tgt_emb, attack_type, num_neighbor=ANDA_NUM_NEIGHBOR):
+    adv = tf.identity(x)
+    g = tf.zeros_like(x)
+    alpha = EPSILON / NUM_ITER
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+    neighbor_bound = ANDA_BETA * EPSILON
+
+    for _ in range(NUM_ITER):
+        candidate_noises = []
+        grad_sum = tf.zeros_like(x)
+
+        with tf.GradientTape() as tape:
+            tape.watch(adv)
+            emb = compute_embedding(model, adv)
+            cos = tf.reduce_sum(emb * tgt_emb, axis=1)
+            loss = attack_loss(cos, attack_type)
+        base_grad = tape.gradient(loss, adv)
+        if base_grad is None:
+            base_grad = tf.zeros_like(adv)
+        base_grad = tf.where(tf.math.is_finite(base_grad), base_grad, tf.zeros_like(base_grad))
+        grad_sum += base_grad
+        base_grad = base_grad / (tf.reduce_mean(tf.abs(base_grad)) + 1e-8)
+        base_noise = adv + alpha * tf.sign(base_grad) - x
+        candidate_noises.append(tf.clip_by_value(base_noise, -EPSILON, EPSILON))
+
+        for _ in range(num_neighbor):
+            noise = tf.random.uniform(tf.shape(x), -neighbor_bound, neighbor_bound, dtype=x.dtype)
+            x_neighbor = tf.clip_by_value(adv + noise, -1.0, 1.0)
+            x_neighbor = tf.clip_by_value(x_neighbor, x - EPSILON, x + EPSILON)
+
+            with tf.GradientTape() as tape_n:
+                tape_n.watch(x_neighbor)
+                emb_n = compute_embedding(model, x_neighbor)
+                cos_n = tf.reduce_sum(emb_n * tgt_emb, axis=1)
+                loss_n = attack_loss(cos_n, attack_type)
+            grad_n = tape_n.gradient(loss_n, x_neighbor)
+            if grad_n is None:
+                grad_n = tf.zeros_like(x_neighbor)
+            grad_n = tf.where(tf.math.is_finite(grad_n), grad_n, tf.zeros_like(grad_n))
+            grad_sum += grad_n
+            grad_n = grad_n / (tf.reduce_mean(tf.abs(grad_n)) + 1e-8)
+            candidate = x_neighbor + alpha * tf.sign(grad_n) - x
+            candidate_noises.append(tf.clip_by_value(candidate, -EPSILON, EPSILON))
+
+        noise_mean, cov_sqrt = _anda_collect_distribution(candidate_noises)
+        sampled_noise = _anda_sample(noise_mean, cov_sqrt, tf.shape(x), ANDA_SAMPLE_SCALE)
+        sampled_noise = tf.clip_by_value(sampled_noise, -EPSILON, EPSILON)
+
+        grad = grad_sum / float(num_neighbor + 1)
+        grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
+        g = DECAY * g + grad
+
+        adv = x + sampled_noise
+        adv = adv + alpha * tf.sign(g)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+
+    return adv
+
 def dpa_hma(model, x, tgt_emb, attack_type, num_copies: int = 8, num_iter: int = DPA_HMA_NUM_ITER):
     _ensure_dpa_hma_seed()
     tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
@@ -1540,6 +1627,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return dpa_hma(model, src, tgt_emb, attack_type)
     if attack_name == 'DYNAMIC_MORPH':
         return dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size)
+    if attack_name == 'ANDA':
+        return anda_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'DPA_HMA_ENSEMBLE':
         raise ValueError(
             'DPA_HMA_ENSEMBLE requires dpa_hma_ensemble(...) with victim-specific '
