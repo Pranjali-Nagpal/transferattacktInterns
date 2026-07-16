@@ -18,6 +18,7 @@ Student-contributed attacks now included:
 - ATT_CNN
 - LI_BOOST_MI
 - DPA_HMA
+- MFAA
 
 Not included:
 - extra objective-level modifications from other project branches

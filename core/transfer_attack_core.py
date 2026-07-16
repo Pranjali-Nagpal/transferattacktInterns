@@ -37,6 +37,7 @@ ALL_ATTACKS = [
     'GRA',
     'IDAA',
     'DPA_HMA',
+    'MFAA',
     'DYNAMIC_MORPH',
 ]
 
@@ -56,6 +57,7 @@ ATTACK_COLS = {
     'LI_BOOST_MI': 'li_boost_mi_path',
     'GRA': 'gra_path',
     'IDAA': 'idaa_path',
+    'MFAA': 'mfaa_path',
     'DYNAMIC_MORPH': 'dynamic_morph_path',
     'DPA_HMA': 'dpa_hma_path',
 }
@@ -76,6 +78,9 @@ LIBOOST_N = 30
 GRA_NUM_NEIGHBOR = 20
 GRA_BETA = 3.5
 GRA_SIGN_DECAY = 0.94
+MFAA_NUM_ENS = 8
+MFAA_KEEP_PROB = 0.8
+MFAA_EMBEDDING_WEIGHT = 0.2
 DPA_HMA_SEED = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_SEED', '1'))
 DPA_HMA_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_NUM_ITER', str(NUM_ITER)))
 DPA_HMA_ENSEMBLE_NUM_ITER = int(os.environ.get('TRANSFER_ATTACK_DPA_HMA_ENSEMBLE_NUM_ITER', str(DPA_HMA_NUM_ITER)))
@@ -1257,6 +1262,124 @@ def dpa_hma_ensemble(
     return tf.identity(adv)
 
 
+def _mfaa_l2_normalize_feature(x, eps=1e-8):
+    flat = tf.reshape(x, [tf.shape(x)[0], -1])
+    norm = tf.sqrt(tf.reduce_sum(tf.square(flat), axis=1, keepdims=True) + eps)
+    return tf.reshape(flat / norm, tf.shape(x))
+
+
+def _mfaa_is_spatial_tensor(layer):
+    shape = getattr(layer, 'output_shape', None)
+    if shape is None:
+        try:
+            shape = layer.output.shape
+        except Exception:
+            return False
+    if isinstance(shape, list):
+        return False
+    return len(shape) == 4
+
+
+def _mfaa_select_feature_layers(model, max_layers=5):
+    spatial_layers = []
+    for layer in getattr(model, 'layers', []):
+        if _mfaa_is_spatial_tensor(layer):
+            spatial_layers.append(layer)
+    if not spatial_layers:
+        return []
+    if len(spatial_layers) <= max_layers:
+        return spatial_layers
+    positions = np.linspace(0, len(spatial_layers) - 1, max_layers).round().astype(int)
+    selected = []
+    seen = set()
+    for pos in positions:
+        layer = spatial_layers[int(pos)]
+        if layer.name not in seen:
+            selected.append(layer)
+            seen.add(layer.name)
+    return selected
+
+
+def _mfaa_build_feature_model(model):
+    layers = _mfaa_select_feature_layers(model)
+    if not layers:
+        return None
+    outputs = [model.output] + [layer.output for layer in layers]
+    return tf.keras.Model(inputs=model.input, outputs=outputs)
+
+
+def _mfaa_score_from_embedding(emb, tgt_emb, attack_type):
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+    cos = tf.reduce_sum(emb * tgt_emb, axis=1)
+    return attack_loss(cos, attack_type)
+
+
+def _mfaa_guidance(feature_model, x, tgt_emb, attack_type):
+    accum = None
+    for _ in range(MFAA_NUM_ENS):
+        mask = tf.cast(
+            tf.random.uniform(tf.shape(x), minval=0.0, maxval=1.0) < MFAA_KEEP_PROB,
+            x.dtype
+        )
+        x_drop = tf.identity(x * mask)
+        with tf.GradientTape() as tape:
+            tape.watch(x_drop)
+            outs = feature_model(x_drop, training=False)
+            emb = tf.nn.l2_normalize(outs[0], axis=1)
+            feats = outs[1:]
+            score = _mfaa_score_from_embedding(emb, tgt_emb, attack_type)
+        grads = tape.gradient(score, feats)
+        grads = [
+            tf.zeros_like(feat) if grad is None else grad
+            for grad, feat in zip(grads, feats)
+        ]
+        if accum is None:
+            accum = grads
+        else:
+            accum = [a + g for a, g in zip(accum, grads)]
+    return [_mfaa_l2_normalize_feature(g / float(MFAA_NUM_ENS)) for g in accum]
+
+
+def mfaa_attack(model, x, tgt_emb, attack_type):
+    """CNN-compatible MFAA adaptation for face-verification embeddings.
+
+    MFAA was proposed for image-classification surrogates with fixed layer taps.
+    This adaptation keeps the multi-feature attention idea, but replaces the
+    class-logit objective with the repository's embedding-similarity objective
+    so the same implementation can support impersonation and dodging attacks.
+    """
+    feature_model = _mfaa_build_feature_model(model)
+    if feature_model is None:
+        return mi_fgsm(model, x, tgt_emb, attack_type)
+
+    adv = tf.identity(x)
+    momentum = tf.zeros_like(x)
+    alpha = EPSILON / NUM_ITER
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+    guidance = _mfaa_guidance(feature_model, x, tgt_emb, attack_type)
+    clean_outs = feature_model(x, training=False)
+    clean_feats = [tf.stop_gradient(feat) for feat in clean_outs[1:]]
+
+    for _ in range(NUM_ITER):
+        with tf.GradientTape() as tape:
+            tape.watch(adv)
+            outs = feature_model(adv, training=False)
+            emb = tf.nn.l2_normalize(outs[0], axis=1)
+            feats = outs[1:]
+            embedding_score = _mfaa_score_from_embedding(emb, tgt_emb, attack_type)
+            feature_score = 0.0
+            for adv_feat, clean_feat, guide in zip(feats, clean_feats, guidance):
+                feature_score += tf.reduce_mean((adv_feat - clean_feat) * guide)
+            loss = feature_score + MFAA_EMBEDDING_WEIGHT * embedding_score
+        grad = tape.gradient(loss, adv)
+        grad = grad / (tf.reduce_mean(tf.abs(grad)) + 1e-8)
+        momentum = DECAY * momentum + grad
+        adv = adv + alpha * tf.sign(momentum)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+    return adv
+
+
 def idaa(model,x,tgt_emb,attack_type,input_size,num_scale=5):
 
     adv = tf.Variable(tf.identity(x),
@@ -1455,6 +1578,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return idaa(model, src, tgt_emb, attack_type, input_size)
     if attack_name == 'DPA_HMA':
         return dpa_hma(model, src, tgt_emb, attack_type)
+    if attack_name == 'MFAA':
+        return mfaa_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'DYNAMIC_MORPH':
         return dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size)
     if attack_name == 'DPA_HMA_ENSEMBLE':
